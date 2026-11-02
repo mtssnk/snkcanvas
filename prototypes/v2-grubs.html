@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snkcanvas</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0c1484; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="flow" aria-hidden="true"></canvas>
+
+<script id="vert" type="x-shader">#version 300 es
+out vec2 vUv;
+void main() {
+  // Single fullscreen triangle.
+  vUv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+
+<!-- Field pass: every body writes into one shared height surface. -->
+<script id="field" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv;
+layout(location = 0) out vec4 outAlbedo;   // rgb colour, a height
+layout(location = 1) out vec4 outRim;      // rgb rim colour, a pressure
+
+const int WORMS = __WORMS__;
+const int NODES = __NODES__;
+const float TAU = 6.2831853;
+const float BLEND = 32.0;   // lower melts bodies together, higher keeps them distinct
+const float MERGE = 40.0;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec4  uNode[WORMS * NODES];    // x, y, radius, depth
+uniform float uPress[WORMS * NODES];
+uniform vec3  uFrom[6];                // pale, deep, neon a, neon b, neon c, ground
+uniform vec3  uTo[6];
+uniform float uMorph;
+
+float drift(vec2 p, float t, float seed) {
+  return 0.5 + 0.5 * sin(p.x * 1.7 + sin(p.y * 2.1 + seed + t * 0.13) * 1.6 + t * 0.09 + seed * 2.1);
+}
+
+// Colour travels across the frame as a soft front rather than cross-fading.
+vec3 paint(int i, vec2 p, float t) {
+  float front = uMorph * 2.2 - 0.6 + (drift(p * 0.8, t, 7.0 + float(i)) - 0.5) * 0.9;
+  return mix(uFrom[i], uTo[i], smoothstep(0.0, 0.6, front));
+}
+
+// Three neon tones looped along a body.
+vec3 neon(float x, vec2 p, float t) {
+  x = fract(x) * 3.0;
+  float f = smoothstep(0.1, 0.9, fract(x));
+  int i = int(x);
+  return mix(paint(2 + i, p, t), paint(2 + (i + 1) % 3, p, t), f);
+}
+
+void main() {
+  float t = uTime;
+  vec2 p = (vUv - 0.5) * uRes / sqrt(uRes.x * uRes.y);
+
+  float heights[WORMS + 1];
+  vec3 albedos[WORMS + 1];
+  vec3 rims[WORMS + 1];
+  float pressures[WORMS + 1];
+  float top = -0.34;
+
+  for (int w = 0; w < WORMS; w++) {
+    // Segments merge through a smooth minimum into one tube, carrying position
+    // along the body with them. Picking only the nearest would tear the surface
+    // wherever a body folds back near itself.
+    float seed = float(w) * 1.93;
+    float sum = 1e-30, sumSharp = 1e-37, sumAlong = 0.0, sumPress = 0.0, sumRadius = 0.0, sumDepth = 0.0;
+    for (int i = 0; i < NODES - 1; i++) {
+      vec4 a = uNode[w * NODES + i];
+      vec4 b = uNode[w * NODES + i + 1];
+      vec2 pa = p - a.xy, ba = b.xy - a.xy;
+      float k = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+      float radius = mix(a.z, b.z, k);
+      float weight = exp(-min(length(pa - ba * k) - radius, 0.9) * MERGE);
+      sum += weight;
+      // Attributes switch faster than the shape, so a fold doesn't smear them.
+      float sharp = weight * weight;
+      sumSharp += sharp;
+      sumAlong += (float(i) + k) * sharp;
+      sumRadius += radius * weight;
+      sumDepth += mix(a.w, b.w, k) * weight;
+      sumPress += mix(uPress[w * NODES + i], uPress[w * NODES + i + 1], k) * weight;
+    }
+    float edge = -log(sum) / MERGE;
+    float s = sumAlong / sumSharp / float(NODES - 1);
+    float radius = sumRadius / sum;
+    float press = sumPress / sum;
+
+    // A swell runs down the body, independent of the crawl itself.
+    float swell = 1.0 + 0.1 * sin(s * 17.0 - t * 0.7 + seed);
+    float e = max(edge + radius, 0.0) / (radius * swell);
+    radius *= swell;
+
+    // Soft rolls of the body. They bow across the tube, as rings on a cylinder
+    // do, and come and go along its length.
+    float ring = 0.5 + 0.5 * cos(s * TAU * 7.0 + e * e * 1.6 + seed + t * 0.12);
+    float presence = smoothstep(0.2, 0.75, drift(vec2(s * 5.0, seed), t * 1.6, seed));
+    float crease = (1.0 - ring) * (1.0 - ring) * (0.03 + 0.13 * presence);
+
+    float h = e < 1.0 ? radius * pow(1.0 - e * e, 0.6) * (1.0 - crease) : -0.5 * (1.0 - exp(-(e - 1.0) * 1.5));
+    h = max(h + sumDepth / sum, -0.6);
+
+    heights[w] = h;
+    float tone = s * 0.85 + float(w) * 0.31 + t * 0.022 + press * 0.22;
+    albedos[w] = neon(tone, p, t);
+    rims[w] = neon(tone + 0.42, p, t);
+    pressures[w] = press;
+    top = max(top, h);
+  }
+
+  // Ground, far below the bodies.
+  heights[WORMS] = -0.34;
+  albedos[WORMS] = mix(paint(5, p, t), paint(0, p, t), smoothstep(0.15, 0.95, drift(p * 1.3, t * 0.6, 3.0)));
+  rims[WORMS] = paint(2, p, t);
+  pressures[WORMS] = 0.0;
+
+  // Soft maximum: the highest body wins, and contacts blend into a fold.
+  float total = 0.0, press = 0.0;
+  vec3 albedo = vec3(0.0), rim = vec3(0.0);
+  for (int w = 0; w <= WORMS; w++) {
+    float weight = exp((heights[w] - top) * BLEND);
+    total += weight;
+    albedo += albedos[w] * weight;
+    rim += rims[w] * weight;
+    press += pressures[w] * weight;
+  }
+  float height = top + log(total) / BLEND;
+
+  outAlbedo = vec4(albedo / total, height);
+  outRim = vec4(rim / total, press / total);
+}
+</script>
+
+<!-- Shade pass: lights the surface. Reads neighbours, so bodies affect each other's colour. -->
+<script id="shade" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uAlbedo;
+uniform sampler2D uRim;
+uniform vec2  uRes;
+uniform float uScale;      // world units per scene pixel
+uniform vec3  uPale;
+uniform vec3  uDeep;
+
+const vec3 LIGHT = vec3(-0.46, 0.62, 0.64);
+
+void main() {
+  vec2 px = 1.0 / uRes;
+  vec4 here = texture(uAlbedo, vUv);
+  vec4 rimHere = texture(uRim, vUv);
+  float H = here.a;
+
+  float dx = texture(uAlbedo, vUv + vec2(px.x, 0)).a - texture(uAlbedo, vUv - vec2(px.x, 0)).a;
+  float dy = texture(uAlbedo, vUv + vec2(0, px.y)).a - texture(uAlbedo, vUv - vec2(0, px.y)).a;
+  vec3 n = normalize(vec3(-vec2(dx, dy) / (2.0 * uScale) * 0.7, 1.0));
+
+  // Two rings of samples: how far this point sits below its surroundings, and
+  // what colour those surroundings are.
+  float occlusion = 0.0;
+  vec3 bounce = vec3(0.0);
+  float aspect = uRes.x / uRes.y;
+  float rootA = sqrt(aspect);
+  for (int i = 0; i < 12; i++) {
+    float a = float(i) * 2.39996;
+    float r = (i % 2 == 0) ? 0.02 : 0.055;
+    vec2 uv = vUv + vec2(cos(a) / rootA, sin(a) * rootA) * r;
+    vec4 s = texture(uAlbedo, uv);
+    float above = max(s.a - H, 0.0);
+    occlusion += min(above * 9.0, 1.0);
+    bounce += texture(uRim, uv).rgb * min(above * 12.0, 1.0);
+  }
+  occlusion /= 12.0;
+  bounce /= 12.0;
+
+  // Short march towards the light for soft cast shadows.
+  float shadow = 0.0;
+  vec2 lightDir = normalize(LIGHT.xy);
+  for (int i = 1; i <= 7; i++) {
+    float d = float(i) * 0.014;
+    vec2 uv = vUv + vec2(lightDir.x / rootA, lightDir.y * rootA) * d;
+    float ray = H + d * 1.1;
+    shadow = max(shadow, (texture(uAlbedo, uv).a - ray) * 8.0);
+  }
+  shadow = clamp(shadow, 0.0, 1.0);
+
+  float diffuse = dot(n, LIGHT);
+  float facing = n.z;
+  float fresnel = pow(1.0 - facing, 3.0);
+
+  // Airbrushed ramp: deep in the turned-away flank, full colour, then chalky
+  // pale at the crest, as in the reference prints.
+  vec3 deep = mix(uDeep, here.rgb * 0.45, 0.5);
+  vec3 col = mix(deep, here.rgb, smoothstep(-0.35, 0.42, diffuse));
+  col = mix(col, uPale, smoothstep(0.8, 1.06, diffuse) * 0.26);
+
+  col *= 1.0 - 0.55 * shadow;
+  col = mix(col, deep, occlusion * 0.75);
+
+  // Neon: the rim glows in a contrasting tone, and squeezed flesh flushes hot.
+  float pressure = clamp(rimHere.a, 0.0, 1.0);
+  col = mix(col, rimHere.rgb, min(fresnel * (1.2 + 1.0 * pressure), 0.95));
+  col = mix(col, rimHere.rgb, pressure * 0.2);
+
+  // Light thrown from the bodies pressing in on this one.
+  col = mix(col, bounce * 2.0, min(occlusion * 1.1, 0.6));
+
+  float stipple = clamp(occlusion * 2.0 + fresnel * 1.4 + shadow * 0.6, 0.0, 1.0);
+  fragColor = vec4(col, stipple);
+}
+</script>
+
+<!-- Composite pass: runs at full resolution so the grain stays sharp. -->
+<script id="post" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uScene;
+uniform float uGrainSeed;
+uniform float uPixel;     // device pixels per grain cell
+
+float hash(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+// Two-pixel value noise: film grain clumps, it isn't per-pixel static.
+float grain(vec2 px, float seed) {
+  vec2 c = px / uPixel;
+  vec2 i = floor(c), f = fract(c);
+  f = f * f * (3.0 - 2.0 * f);
+  vec2 s = vec2(seed * 17.0, seed * 41.0);
+  float n = mix(mix(hash(i + s), hash(i + s + vec2(1, 0)), f.x),
+                mix(hash(i + s + vec2(0, 1)), hash(i + s + vec2(1, 1)), f.x), f.y);
+  return n + (hash(gl_FragCoord.xy + s) - 0.5) * 0.45 - 0.5;
+}
+
+void main() {
+  vec4 scene = texture(uScene, vUv);
+  vec3 col = scene.rgb;
+
+  // Grain is strongest in the turning flanks, like airbrush stipple.
+  float n = grain(gl_FragCoord.xy, uGrainSeed);
+  float amount = 0.04 + 0.13 * scene.a;
+  col += n * amount * (0.55 + 0.45 * (1.0 - abs(dot(col, vec3(0.33)) * 2.0 - 1.0)));
+
+  // Fixed dust on the emulsion.
+  vec2 cell = floor(gl_FragCoord.xy / (uPixel * 1.5));
+  if (hash(cell + 3.7) > 0.9994) col *= 0.82;
+
+  // Gentle corner falloff.
+  vec2 v = vUv - 0.5;
+  col *= 1.0 - dot(v, v) * 0.22;
+
+  fragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const num = (key, fallback) => params.has(key) ? parseFloat(params.get(key)) : fallback;
+
+  // Tuned up from the reference images: pale, deep, neon a, neon b, neon c, ground.
+  const PALETTES = [
+    ['#e2e6e2', '#0c1484', '#1c2cff', '#37f08a', '#6a2cf0', '#0a106c'],
+    ['#e8edf0', '#0f3a6b', '#ff5a14', '#1f7fd0', '#ffa050', '#0c2c54'],
+    ['#ffd8cc', '#7a1030', '#ff3a1e', '#35d6ff', '#e0228a', '#5c0c26'],
+    ['#fbf4e6', '#8a5a18', '#ffb52e', '#2f9dff', '#ff8a1e', '#6a4410'],
+  ].map(p => p.flatMap(hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255)));
+
+  const WORMS = 4;
+  const NODES = 18;
+  const HOLD = 9;            // seconds on a palette
+  const MORPH = 14;          // seconds moving to the next
+  const SPEED = num('speed', 1);
+  const SCENE_SCALE = 0.5;
+  const MAX_DPR = 2;
+  const STEP = 1 / 60;
+  const WARMUP = 900;        // steps simulated before the first frame, so bodies start tangled
+
+  /* ---------- Soft bodies ---------- */
+
+  const COUNT = WORMS * NODES;
+  const x = new Float32Array(COUNT), y = new Float32Array(COUNT);
+  const px = new Float32Array(COUNT), py = new Float32Array(COUNT);
+  const radius = new Float32Array(COUNT), depth = new Float32Array(COUNT);
+  const pressure = new Float32Array(COUNT), squeeze = new Float32Array(COUNT);
+  const nodeData = new Float32Array(COUNT * 4);
+
+  const SIZES = [0.165, 0.125, 0.145, 0.11];
+  const SEGMENT = 0.12;
+  const MAX_MOVE = 0.003;    // per step, about a sixth of the frame each second
+  let boundX = 0.8, boundY = 0.6;
+  let simTime = 0;
+
+  for (let w = 0; w < WORMS; w++) {
+    for (let i = 0; i < NODES; i++) {
+      const n = w * NODES + i;
+      x[n] = px[n] = (i - NODES / 2) * SEGMENT * (w % 2 ? -1 : 1);
+      y[n] = py[n] = (w - WORMS / 2 + 0.5) * 0.36 + Math.sin(i * 0.6 + w) * 0.08;
+      radius[n] = SIZES[w];
+    }
+  }
+
+  const stepBodies = dt => {
+    simTime += dt;
+    const t = simTime;
+    pressure.fill(0);
+
+    for (let w = 0; w < WORMS; w++) {
+      // Both ends creep around outside the frame, so only bendy middles are ever
+      // seen, and the bodies are dragged across each other as they go.
+      const head = w * NODES, tail = head + NODES - 1;
+      const rim = angle => {
+        const c = Math.cos(angle), s = Math.sin(angle);
+        return [Math.sign(c) * Math.sqrt(Math.abs(c)) * boundX, Math.sign(s) * Math.sqrt(Math.abs(s)) * boundY];
+      };
+      const angle = t * (0.06 + w * 0.013) + w * 1.9;
+      const [hx, hy] = rim(angle), [ex, ey] = rim(angle + Math.PI + 0.7 * Math.sin(t * 0.07 + w));
+
+      for (let i = 0; i < NODES; i++) {
+        const n = w * NODES + i;
+        // A slow swirl keeps every part of the body wandering.
+        let ax = Math.sin(y[n] * 2.3 + t * 0.31 + w) * 0.9;
+        let ay = Math.sin(x[n] * 2.1 - t * 0.26 + w * 2.0) * 0.9;
+        if (n === head) { ax += (hx - x[n]) * 6; ay += (hy - y[n]) * 6; }
+        if (n === tail) { ax += (ex - x[n]) * 6; ay += (ey - y[n]) * 6; }
+        const vx = (x[n] - px[n]) * 0.45, vy = (y[n] - py[n]) * 0.45;
+        px[n] = x[n]; py[n] = y[n];
+        x[n] += vx + ax * dt * dt;
+        y[n] += vy + ay * dt * dt;
+      }
+    }
+
+    for (let pass = 0; pass < 3; pass++) {
+      for (let w = 0; w < WORMS; w++) {
+        const base = w * NODES;
+        for (let i = 0; i < NODES - 1; i++) {
+          // Crawling: a contraction wave shortens the links it passes through.
+          const a = base + i, b = a + 1;
+          const rest = SEGMENT * (1 + 0.2 * Math.sin(i * 0.95 - t * 0.5 + w * 1.7));
+          const dx = x[b] - x[a], dy = y[b] - y[a];
+          const d = Math.hypot(dx, dy) || 1e-5;
+          const k = 0.5 * (d - rest) / d * 0.7;
+          x[a] += dx * k; y[a] += dy * k;
+          x[b] -= dx * k; y[b] -= dy * k;
+        }
+        // Stiffness: bodies bend in fat curves, never kink.
+        for (let i = 1; i < NODES - 1; i++) {
+          const n = base + i;
+          const mx = (x[n - 1] + x[n + 1]) / 2, my = (y[n - 1] + y[n + 1]) / 2;
+          x[n] += (mx - x[n]) * 0.2;
+          y[n] += (my - y[n]) * 0.2;
+        }
+      }
+
+      // Collisions: bodies are allowed to sink a little into each other, which
+      // is what makes them read as soft.
+      for (let a = 0; a < COUNT; a++) {
+        for (let b = a + 1; b < COUNT; b++) {
+          const same = Math.floor(a / NODES) === Math.floor(b / NODES);
+          if (same && b - a < 4) continue;
+          const dx = x[b] - x[a], dy = y[b] - y[a];
+          const reach = (radius[a] + radius[b]) * 0.84;
+          const dd = dx * dx + dy * dy;
+          if (dd >= reach * reach) continue;
+          const d = Math.sqrt(dd) || 1e-5;
+          const overlap = (reach - d) / reach;
+          const push = (reach - d) / d * 0.05;
+          x[a] -= dx * push; y[a] -= dy * push;
+          x[b] += dx * push; y[b] += dy * push;
+          pressure[a] += overlap; pressure[b] += overlap;
+        }
+      }
+
+      // The pointer is a blunt finger pressing into the pile.
+      if (pointer.z > 0.01) {
+        const reach = 0.2 * pointer.z;
+        for (let n = 0; n < COUNT; n++) {
+          const dx = x[n] - pointer.x, dy = y[n] - pointer.y;
+          const d = Math.hypot(dx, dy) || 1e-5;
+          const limit = reach + radius[n] * 0.5;
+          if (d < limit) {
+            const push = (limit - d) / d * 0.12;
+            x[n] += dx * push; y[n] += dy * push;
+            pressure[n] += (limit - d) / limit * 0.5;
+          }
+        }
+      }
+
+      for (let n = 0; n < COUNT; n++) {
+        if (x[n] >  boundX) x[n] += ( boundX - x[n]) * 0.08;
+        if (x[n] < -boundX) x[n] += (-boundX - x[n]) * 0.08;
+        if (y[n] >  boundY) y[n] += ( boundY - y[n]) * 0.08;
+        if (y[n] < -boundY) y[n] += (-boundY - y[n]) * 0.08;
+      }
+    }
+
+    // Nothing may move fast: a body forced past another squeezes through slowly
+    // instead of popping.
+    for (let n = 0; n < COUNT; n++) {
+      const dx = x[n] - px[n], dy = y[n] - py[n];
+      const d = Math.hypot(dx, dy);
+      if (d > MAX_MOVE) {
+        x[n] = px[n] + dx / d * MAX_MOVE;
+        y[n] = py[n] + dy / d * MAX_MOVE;
+      }
+    }
+
+    // Volume is conserved, roughly: a stretched section thins, a squashed one
+    // fattens. Pressure is smoothed down the body so flushes bloom and fade.
+    for (let w = 0; w < WORMS; w++) {
+      const base = w * NODES;
+      for (let i = 0; i < NODES; i++) {
+        const n = base + i;
+        const a = base + Math.max(i - 1, 0), b = base + Math.min(i + 1, NODES - 1);
+        const span = Math.hypot(x[b] - x[a], y[b] - y[a]) / ((b - a) * SEGMENT);
+        const end = Math.min(i, NODES - 1 - i) / (NODES - 1) * 2;
+        const taper = 0.62 + 0.38 * Math.sqrt(Math.min(end * 3.2, 1));
+        const target = SIZES[w] * taper * Math.min(1.3, Math.max(0.74, Math.pow(span, -0.6)));
+        radius[n] += (target - radius[n]) * 0.12;
+        squeeze[n] += (Math.min(pressure[n] * 0.45, 1) - squeeze[n]) * 0.05;
+        // Bodies ride over and under each other as they pass.
+        depth[n] = 0.09 * Math.sin(i * 0.32 + t * 0.21 + w * 2.4) + 0.05 * Math.sin(t * 0.13 + w * 1.1);
+      }
+    }
+    for (let w = 0; w < WORMS; w++) {
+      for (let i = 1; i < NODES - 1; i++) {
+        const n = w * NODES + i;
+        squeeze[n] = (squeeze[n - 1] + squeeze[n] * 2 + squeeze[n + 1]) / 4;
+      }
+    }
+  };
+
+  /* ---------- WebGL ---------- */
+
+  const canvas = document.getElementById('flow');
+  const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'low-power', preserveDrawingBuffer: params.has('still') });
+  if (!gl) return;   // The body background colour stands in.
+  const float = !!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float');
+  if (!float) return;  // The height surface needs a float target.
+
+  const src = id => document.getElementById(id).textContent.trim().replace('__WORMS__', WORMS).replace('__NODES__', NODES);
+  const compile = (type, text) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, text);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const program = fragId => {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, src('vert')));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, src(fragId)));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const uniforms = {};
+    const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < count; i++) {
+      const name = gl.getActiveUniform(p, i).name.replace('[0]', '');
+      uniforms[name] = gl.getUniformLocation(p, name);
+    }
+    return { p, u: uniforms };
+  };
+
+  const field = program('field');
+  const shade = program('shade');
+  const post = program('post');
+  gl.bindVertexArray(gl.createVertexArray());
+
+  const makeTexture = () => {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return tex;
+  };
+  const albedoTex = makeTexture(), rimTex = makeTexture(), shadeTex = makeTexture();
+  const fieldFbo = gl.createFramebuffer(), shadeFbo = gl.createFramebuffer();
+
+  let dpr = 1, sceneW = 1, sceneH = 1;
+  const pointer = { x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0 };
+
+  const resize = () => {
+    dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    sceneW = Math.max(1, Math.round(canvas.width * SCENE_SCALE));
+    sceneH = Math.max(1, Math.round(canvas.height * SCENE_SCALE));
+    for (const tex of [albedoTex, rimTex, shadeTex]) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, sceneW, sceneH, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fieldFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, albedoTex, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, rimTex, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadeFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, shadeTex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // Bodies live in a box a little bigger than the frame, so they enter and leave.
+    const aspect = canvas.width / canvas.height;
+    boundX = Math.sqrt(aspect) / 2 * 1.4;
+    boundY = 0.5 / Math.sqrt(aspect) * 1.4;
+  };
+  new ResizeObserver(resize).observe(canvas);
+  resize();
+
+  window.addEventListener('pointermove', e => {
+    const size = Math.sqrt(innerWidth * innerHeight);
+    pointer.tx = (e.clientX - innerWidth / 2) / size;
+    pointer.ty = (innerHeight / 2 - e.clientY) / size;
+    pointer.tz = 1;
+  });
+  document.documentElement.addEventListener('mouseleave', () => { pointer.tz = 0; });
+
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const still = params.has('still');
+  const fixedPalette = params.has('p') ? parseInt(params.get('p'), 10) : null;
+  const fixedMorph = num('morph', 0);
+
+  let palette = fixedPalette ?? 0;
+  let morphClock = 0;          // seconds spent on this palette
+  let last = performance.now();
+  let raf = 0;
+  let debt = 0;
+
+  // Click to jump straight into the morph.
+  window.addEventListener('click', () => { morphClock = Math.max(morphClock, HOLD); });
+
+  for (let i = 0, end = WARMUP + num('t', 0) * 60; i < end; i++) stepBodies(STEP);
+
+  const draw = () => {
+    const eased = m => m * m * (3 - 2 * m);
+    const morph = still ? fixedMorph : eased(Math.min(1, Math.max(0, (morphClock - HOLD) / MORPH)));
+    const next = (palette + 1) % PALETTES.length;
+
+    for (let n = 0; n < COUNT; n++) {
+      nodeData[n * 4] = x[n];
+      nodeData[n * 4 + 1] = y[n];
+      nodeData[n * 4 + 2] = radius[n];
+      nodeData[n * 4 + 3] = depth[n];
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fieldFbo);
+    gl.viewport(0, 0, sceneW, sceneH);
+    gl.useProgram(field.p);
+    gl.uniform2f(field.u.uRes, sceneW, sceneH);
+    gl.uniform1f(field.u.uTime, simTime);
+    gl.uniform4fv(field.u.uNode, nodeData);
+    gl.uniform1fv(field.u.uPress, squeeze);
+    gl.uniform3fv(field.u.uFrom, PALETTES[palette]);
+    gl.uniform3fv(field.u.uTo, PALETTES[next]);
+    gl.uniform1f(field.u.uMorph, morph);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadeFbo);
+    gl.useProgram(shade.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, albedoTex);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, rimTex);
+    gl.uniform1i(shade.u.uAlbedo, 0);
+    gl.uniform1i(shade.u.uRim, 1);
+    gl.uniform2f(shade.u.uRes, sceneW, sceneH);
+    gl.uniform1f(shade.u.uScale, 1 / Math.sqrt(sceneW * sceneH));
+    const blend = (i) => {
+      const a = PALETTES[palette], b = PALETTES[next];
+      return [0, 1, 2].map(c => a[i * 3 + c] + (b[i * 3 + c] - a[i * 3 + c]) * morph);
+    };
+    gl.uniform3fv(shade.u.uPale, blend(0));
+    gl.uniform3fv(shade.u.uDeep, blend(1));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(post.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, shadeTex);
+    gl.uniform1i(post.u.uScene, 0);
+    gl.uniform1f(post.u.uGrainSeed, Math.floor(performance.now() / 66) % 97 / 97);   // about 15fps, like film
+    gl.uniform1f(post.u.uPixel, Math.max(1, dpr));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  };
+
+  const frame = now => {
+    raf = requestAnimationFrame(frame);
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    morphClock += dt;
+    if (morphClock >= HOLD + MORPH) {
+      morphClock = 0;
+      palette = (palette + 1) % PALETTES.length;
+    }
+    pointer.x += (pointer.tx - pointer.x) * 0.06;
+    pointer.y += (pointer.ty - pointer.y) * 0.06;
+    pointer.z += (pointer.tz - pointer.z) * 0.04;
+
+    // Fixed steps keep the bodies stable whatever the display rate.
+    debt += dt * SPEED;
+    for (let i = 0; debt >= STEP && i < 4; i++) { stepBodies(STEP); debt -= STEP; }
+    if (debt > STEP) debt = 0;
+    draw();
+  };
+
+  if (still || reduced) {
+    draw();
+    window.__ready = true;
+    new ResizeObserver(() => draw()).observe(canvas);
+    return;
+  }
+
+  // Stop rendering whenever the canvas can't be seen.
+  const start = () => { if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); } };
+  const stop = () => { cancelAnimationFrame(raf); raf = 0; };
+  let onScreen = true;
+  new IntersectionObserver(([e]) => { onScreen = e.isIntersecting; onScreen && !document.hidden ? start() : stop(); }).observe(canvas);
+  document.addEventListener('visibilitychange', () => { onScreen && !document.hidden ? start() : stop(); });
+  start();
+})();
+</script>
+</body>
+</html>

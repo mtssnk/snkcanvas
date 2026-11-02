@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>snkcanvas</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0a106c;
+      }
+      canvas {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="flow" aria-hidden="true"></canvas>
+
+    <script id="vert" type="x-shader">
+      #version 300 es
+      out vec2 vUv;
+      void main() {
+        // Single fullscreen triangle.
+        vUv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+        gl_Position = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
+      }
+    </script>
+
+    <!-- Scene pass: neon tubes as the contour lines of one smooth field. -->
+    <script id="scene" type="x-shader">
+      #version 300 es
+      precision highp float;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      const int SOURCES = 5;
+      const float TUBES = 2.33;     // tubes per unit of field; lower is fatter
+      const float POINTER_PULL = 0.4; // how strongly the pointer attracts tubes
+      const float ZOOM = 0.5;      // lower is closer in, with fewer tubes in frame
+      const vec3 LIGHT = vec3(-0.42, 0.58, 0.70);
+
+      uniform vec2  uRes;
+      uniform float uTime;
+      uniform vec3  uFrom[6];      // pale, deep, neon a, neon b, neon c, ground
+      uniform vec3  uTo[6];
+      uniform float uMorph;
+      uniform vec3  uPointer;      // xy position, z strength
+
+      float drift(vec2 p, float t, float seed) {
+        return 0.5 + 0.5 * sin(p.x * 1.7 + sin(p.y * 2.1 + seed + t * 0.13) * 1.6 + t * 0.09 + seed * 2.1);
+      }
+
+      // Colour travels across the frame as a soft front rather than cross-fading.
+      vec3 paint(int i, vec2 p, float t) {
+        float front = uMorph * 2.2 - 0.6 + (drift(p * 0.8, t, 7.0 + float(i)) - 0.5) * 0.9;
+        return mix(uFrom[i], uTo[i], smoothstep(0.0, 0.6, front));
+      }
+
+      // Three neon tones looped smoothly.
+      vec3 neon(float x, vec2 p, float t) {
+        x = fract(x) * 3.0;
+        float f = smoothstep(0.1, 0.9, fract(x));
+        int i = int(x);
+        return mix(paint(2 + i, p, t), paint(2 + (i + 1) % 3, p, t), f);
+      }
+
+      // Gentle sine warp, so rings melt out of round.
+      vec2 melt(vec2 p, float t) {
+        float a = 0.16;
+        float f = 1.5;
+        for (int i = 0; i < 3; i++) {
+          float k = float(i);
+          p += a * vec2(sin(p.y * f + t * 0.17 + k * 1.7), sin(p.x * f * 1.13 - t * 0.14 + k * 2.9));
+          a *= 0.55;
+          f *= 1.5;
+        }
+        return p;
+      }
+
+      // Sum of soft sources and sinks. Contours ring each one, and pinch and join at
+      // the saddles between them: that joining is the melting.
+      float field(vec2 p, float t) {
+        vec2 q = melt(p, t);
+        float f = 0.0;
+        for (int i = 0; i < SOURCES; i++) {
+          float k = float(i);
+          vec2 c = vec2(
+            sin(t * (0.083 + k * 0.017) + k * 2.4) * 0.62,
+            cos(t * (0.071 - k * 0.009) + k * 1.3) * 0.46
+          );
+          float charge = (i % 2 == 0 ? 1.0 : -1.0) * (1.0 - k * 0.09);
+          vec2 d = q - c;
+          f += charge * 0.5 * log(dot(d, d) + 0.05);
+        }
+        vec2 d = p - uPointer.xy * ZOOM;
+        return f + uPointer.z * POINTER_PULL * log(dot(d, d) + 0.12);
+      }
+
+      // One tube's cross-section. `u` runs 0 to 1 from the crisp side to the far side:
+      // a long airbrushed roll with a soft glowing core.
+      vec3 tube(float u, float index, vec2 across, vec2 p, float t) {
+        float x = 2.0 * pow(u, 0.72) - 1.0;
+        vec3 n = normalize(vec3(across * x, sqrt(max(1.0 - x * x, 0.0)) + 0.12));
+
+        float tone = index * 0.09 + u * 0.05 + t * 0.012;
+        vec3 tint = neon(tone, p, t);
+        vec3 rim = neon(tone + 0.4, p, t);
+        vec3 deep = mix(paint(1, p, t), tint * 0.3, 0.35);
+
+        vec3 col = mix(deep, tint, smoothstep(-0.3, 0.6, dot(n, LIGHT)));
+        float core = exp(-pow((u - 0.6) / 0.2, 2.0));
+        col = mix(col, tint * 1.12 + paint(0, p, t) * 0.14, core * 0.4);
+
+        // Coloured light spilling across from the neighbouring tube.
+        return mix(col, rim, exp(-u / 0.06) * 0.8);
+      }
+
+      void main() {
+        float t = uTime;
+        vec2 p = (vUv - 0.5) * uRes / sqrt(uRes.x * uRes.y) * ZOOM;
+
+        // Sources drift very slowly: a small move sweeps many tubes across the frame.
+        float slow = t * 0.28;
+        float f = field(p, slow) * TUBES;
+        // Finite differences rather than dFdx: the slope sets the tube's direction,
+        // and must stay smooth at half resolution.
+        float e = 0.003;
+        vec2 slope = (vec2(field(p + vec2(e, 0), slow), field(p + vec2(0, e), slow)) * TUBES - f) / e;
+        // Fades to flat where the field does, so sources and saddles stay dimple free.
+        vec2 across = slope / sqrt(dot(slope, slope) + 4.0);
+
+        // Steady scroll: tubes are born at sources and drain into sinks, for ever.
+        float phase = f + t * 0.14;
+        float index = floor(phase);
+        float u = phase - index;
+
+        // Tube width in scene pixels, for antialiasing the seam.
+        float pixel = length(slope) * ZOOM / sqrt(uRes.x * uRes.y);
+
+        // Each seam changes from a crisp edge to a full dissolve along its length.
+        float seam = mix(0.012, 0.42, smoothstep(0.3, 0.85, drift(p * 1.3, t * 0.5, 3.0 + index * 0.6)));
+        seam = max(seam, pixel * 1.6);
+        float blend = smoothstep(0.0, seam, 1.0 - u);
+        vec3 col = mix(tube(0.0, index + 1.0, across, p, t), tube(u, index, across, p, t), blend);
+
+        // Where tubes crowd beyond what the pixels can hold, settle to their average.
+        vec3 settled = 0.5 * (tube(0.3, index, across, p, t) + tube(0.8, index, across, p, t));
+        col = mix(col, settled, smoothstep(0.3, 0.8, pixel));
+
+        fragColor = vec4(col, clamp(0.2 + (1.0 - blend) * 0.8, 0.0, 1.0));
+      }
+    </script>
+
+    <!-- Composite pass: runs at full resolution so the grain stays sharp. -->
+    <script id="post" type="x-shader">
+      #version 300 es
+      precision highp float;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      uniform sampler2D uScene;
+      uniform float uGrainSeed;
+      uniform float uPixel;     // device pixels per grain cell
+
+      float hash(vec2 p) {
+        vec3 q = fract(vec3(p.xyx) * 0.1031);
+        q += dot(q, q.yzx + 33.33);
+        return fract((q.x + q.y) * q.z);
+      }
+
+      // Two-pixel value noise: film grain clumps, it isn't per-pixel static.
+      float grain(vec2 px, float seed) {
+        vec2 c = px / uPixel;
+        vec2 i = floor(c), f = fract(c);
+        f = f * f * (3.0 - 2.0 * f);
+        vec2 s = vec2(seed * 17.0, seed * 41.0);
+        float n = mix(mix(hash(i + s), hash(i + s + vec2(1, 0)), f.x),
+                      mix(hash(i + s + vec2(0, 1)), hash(i + s + vec2(1, 1)), f.x), f.y);
+        return n + (hash(gl_FragCoord.xy + s) - 0.5) * 0.45 - 0.5;
+      }
+
+      void main() {
+        vec4 scene = texture(uScene, vUv);
+        vec3 col = scene.rgb;
+
+        float n = grain(gl_FragCoord.xy, uGrainSeed);
+        float amount = 0.03 + 0.11 * scene.a;
+        col += n * amount * (0.55 + 0.45 * (1.0 - abs(dot(col, vec3(0.33)) * 2.0 - 1.0)));
+
+        // Fixed dust on the emulsion.
+        vec2 cell = floor(gl_FragCoord.xy / (uPixel * 1.5));
+        if (hash(cell + 3.7) > 0.9994) col *= 0.82;
+
+        // Gentle corner falloff.
+        vec2 v = vUv - 0.5;
+        col *= 1.0 - dot(v, v) * 0.22;
+
+        fragColor = vec4(col, 1.0);
+      }
+    </script>
+
+    <script>
+      (() => {
+        const params = new URLSearchParams(location.search);
+        const num = (key, fallback) =>
+          params.has(key) ? parseFloat(params.get(key)) : fallback;
+
+        // Tuned up from the reference images: pale, deep, neon a, neon b, neon c, ground.
+        const PALETTES = [
+          ["#e2e6e2", "#0c1484", "#1c2cff", "#37f08a", "#6a2cf0", "#0a106c"],
+          ["#e8edf0", "#0f3a6b", "#ff5a14", "#1f7fd0", "#ffa050", "#0c2c54"],
+          ["#ffd8cc", "#7a1030", "#ff3a1e", "#35d6ff", "#e0228a", "#5c0c26"],
+          ["#fbf4e6", "#8a5a18", "#ffb52e", "#2f9dff", "#ff8a1e", "#6a4410"],
+        ].map((p) =>
+          p.flatMap((hex) =>
+            [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255),
+          ),
+        );
+
+        const HOLD = 9; // seconds on a palette
+        const MORPH = 14; // seconds moving to the next
+        const SPEED = num("speed", 1);
+        const SCENE_SCALE = 0.5;
+        const MAX_DPR = 2;
+
+        const canvas = document.getElementById("flow");
+        const gl = canvas.getContext("webgl2", {
+          antialias: false,
+          alpha: false,
+          powerPreference: "low-power",
+          preserveDrawingBuffer: params.has("still"),
+        });
+        if (!gl) return; // The body background colour stands in.
+
+        const src = (id) => document.getElementById(id).textContent.trim();
+        const compile = (type, text) => {
+          const s = gl.createShader(type);
+          gl.shaderSource(s, text);
+          gl.compileShader(s);
+          if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+            throw new Error(gl.getShaderInfoLog(s));
+          return s;
+        };
+        const program = (fragId) => {
+          const p = gl.createProgram();
+          gl.attachShader(p, compile(gl.VERTEX_SHADER, src("vert")));
+          gl.attachShader(p, compile(gl.FRAGMENT_SHADER, src(fragId)));
+          gl.linkProgram(p);
+          if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+            throw new Error(gl.getProgramInfoLog(p));
+          const uniforms = {};
+          const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+          for (let i = 0; i < count; i++) {
+            const name = gl.getActiveUniform(p, i).name.replace("[0]", "");
+            uniforms[name] = gl.getUniformLocation(p, name);
+          }
+          return { p, u: uniforms };
+        };
+
+        const scene = program("scene");
+        const post = program("post");
+        gl.bindVertexArray(gl.createVertexArray());
+
+        // Float target keeps the long gradients free of banding.
+        const float =
+          !!gl.getExtension("EXT_color_buffer_float") ||
+          !!gl.getExtension("EXT_color_buffer_half_float");
+        const texture = gl.createTexture();
+        const framebuffer = gl.createFramebuffer();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+        let dpr = 1,
+          sceneW = 1,
+          sceneH = 1;
+        const resize = () => {
+          dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+          canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+          canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+          sceneW = Math.max(1, Math.round(canvas.width * SCENE_SCALE));
+          sceneH = Math.max(1, Math.round(canvas.height * SCENE_SCALE));
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          if (float)
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA16F,
+              sceneW,
+              sceneH,
+              0,
+              gl.RGBA,
+              gl.HALF_FLOAT,
+              null,
+            );
+          else
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA8,
+              sceneW,
+              sceneH,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              null,
+            );
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+          gl.framebufferTexture2D(
+            gl.FRAMEBUFFER,
+            gl.COLOR_ATTACHMENT0,
+            gl.TEXTURE_2D,
+            texture,
+            0,
+          );
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        };
+        new ResizeObserver(resize).observe(canvas);
+        resize();
+
+        // The pointer is one more soft source, eased so nothing ever snaps.
+        const POINTER_EASE = 0.01; // share of the gap to the cursor closed each frame
+        const pointer = { x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0 };
+        window.addEventListener("pointermove", (e) => {
+          const size = Math.sqrt(innerWidth * innerHeight);
+          pointer.tx = (e.clientX - innerWidth / 2) / size;
+          pointer.ty = (innerHeight / 2 - e.clientY) / size;
+          pointer.tz = 1;
+        });
+        document.documentElement.addEventListener("mouseleave", () => {
+          pointer.tz = 0;
+        });
+
+        const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+        const still = params.has("still");
+        const fixedPalette = params.has("p")
+          ? parseInt(params.get("p"), 10)
+          : null;
+        const fixedMorph = num("morph", 0);
+
+        let palette = fixedPalette ?? 0;
+        let clock = num("t", 20);
+        let morphClock = 0; // seconds spent on this palette
+        let last = performance.now();
+        let raf = 0;
+
+        // Click to jump straight into the morph.
+        window.addEventListener("click", () => {
+          morphClock = Math.max(morphClock, HOLD);
+        });
+
+        const draw = () => {
+          const eased = (m) => m * m * (3 - 2 * m);
+          const morph = still
+            ? fixedMorph
+            : eased(Math.min(1, Math.max(0, (morphClock - HOLD) / MORPH)));
+          const next = (palette + 1) % PALETTES.length;
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+          gl.viewport(0, 0, sceneW, sceneH);
+          gl.useProgram(scene.p);
+          gl.uniform2f(scene.u.uRes, sceneW, sceneH);
+          gl.uniform1f(scene.u.uTime, clock);
+          gl.uniform3fv(scene.u.uFrom, PALETTES[palette]);
+          gl.uniform3fv(scene.u.uTo, PALETTES[next]);
+          gl.uniform1f(scene.u.uMorph, morph);
+          gl.uniform3f(scene.u.uPointer, pointer.x, pointer.y, pointer.z);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, canvas.width, canvas.height);
+          gl.useProgram(post.p);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          gl.uniform1i(post.u.uScene, 0);
+          gl.uniform1f(
+            post.u.uGrainSeed,
+            (Math.floor(performance.now() / 66) % 97) / 97,
+          ); // about 15fps, like film
+          gl.uniform1f(post.u.uPixel, Math.max(1, dpr));
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        };
+
+        const frame = (now) => {
+          raf = requestAnimationFrame(frame);
+          const dt = Math.min(0.05, (now - last) / 1000);
+          last = now;
+          clock += dt * SPEED;
+          morphClock += dt;
+          if (morphClock >= HOLD + MORPH) {
+            morphClock = 0;
+            palette = (palette + 1) % PALETTES.length;
+          }
+          pointer.x += (pointer.tx - pointer.x) * POINTER_EASE;
+          pointer.y += (pointer.ty - pointer.y) * POINTER_EASE;
+          pointer.z += (pointer.tz - pointer.z) * POINTER_EASE;
+          draw();
+        };
+
+        if (still || reduced) {
+          draw();
+          window.__ready = true;
+          new ResizeObserver(() => draw()).observe(canvas);
+          return;
+        }
+
+        // Stop rendering whenever the canvas can't be seen.
+        const start = () => {
+          if (!raf) {
+            last = performance.now();
+            raf = requestAnimationFrame(frame);
+          }
+        };
+        const stop = () => {
+          cancelAnimationFrame(raf);
+          raf = 0;
+        };
+        let onScreen = true;
+        new IntersectionObserver(([e]) => {
+          onScreen = e.isIntersecting;
+          onScreen && !document.hidden ? start() : stop();
+        }).observe(canvas);
+        document.addEventListener("visibilitychange", () => {
+          onScreen && !document.hidden ? start() : stop();
+        });
+        start();
+      })();
+    </script>
+  </body>
+</html>

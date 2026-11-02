@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snkcanvas</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1428ac; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="flow" aria-hidden="true"></canvas>
+
+<script id="vert" type="x-shader">#version 300 es
+out vec2 vUv;
+void main() {
+  // Single fullscreen triangle.
+  vUv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+
+<!-- Scene pass: stacked airbrushed sheets. Rendered below display resolution. -->
+<script id="scene" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uFrom[7];
+uniform vec3  uTo[7];
+uniform float uMorph;
+uniform vec3  uPointer;   // xy position, z strength
+
+const float ZOOM = 0.72;  // below 1 frames the forms close up, like the references
+
+float stipple;            // accumulated "half-painted" amount, drives grain
+
+// Iterated sine warp: bends straight lines into folds and lobes.
+vec2 flow(vec2 p, float t, float seed, float amp) {
+  float a = amp;
+  float f = 1.15;
+  for (int i = 0; i < 4; i++) {
+    float k = float(i);
+    p += a * vec2(
+      sin(p.y * f + t * (0.31 + 0.07 * k) + seed + k * 1.7),
+      sin(p.x * f * 1.13 - t * (0.27 + 0.05 * k) + seed * 1.3 + k * 2.9)
+    );
+    a *= 0.5;
+    f *= 1.3;
+  }
+  return p;
+}
+
+// Slow 0..1 variation, used to make an edge change character along its length.
+float drift(vec2 p, float t, float seed) {
+  return 0.5 + 0.5 * sin(p.x * 1.7 + sin(p.y * 2.1 + seed + t * 0.13) * 1.6 + t * 0.09 + seed * 2.1);
+}
+
+// Field divided by its gradient, so `d` is roughly a distance from the edge.
+float distanceOf(float f) {
+  float g = length(vec2(dFdx(f), dFdy(f))) * sqrt(uRes.x * uRes.y);
+  return f / max(g, 0.45);
+}
+
+// Paint one sheet. Inside the edge (d > 0) the pigment is densest near the
+// stencil line and falls away; `crisp` sets the stencil hardness, `soft` the
+// reach of the falloff. Outside the edge nothing lands.
+void sheet(inout vec3 col, float d, float crisp, float soft, vec3 tint, float opacity) {
+  float edge = smoothstep(-crisp * 0.35, crisp, d);
+  float a = edge * exp(-max(d, 0.0) / soft) * opacity;
+  col = mix(col, tint, a);
+  stipple += a * (1.0 - a);
+}
+
+// A thin glint along part of an edge, tapering in and out.
+void glint(inout vec3 col, float d, float strength, vec3 tint) {
+  col = mix(col, tint, strength * exp(-d * d / 0.000012));
+}
+
+float smax(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
+  return mix(b, a, h) + k * h * (1.0 - h);
+}
+
+// Colour travels across the frame as a soft front rather than cross-fading.
+vec3 paint(int i, vec2 p, float t) {
+  float front = uMorph * 2.2 - 0.6 + (drift(p * 0.8, t, 7.0 + float(i)) - 0.5) * 0.9 - float(i) * 0.04;
+  return mix(uFrom[i], uTo[i], smoothstep(0.0, 0.6, front));
+}
+
+void main() {
+  float t = uTime;
+  vec2 p = (vUv - 0.5) * uRes / sqrt(uRes.x * uRes.y) * ZOOM;
+
+  // The pointer leans on the whole surface, very gently.
+  vec2 toPointer = p - uPointer.xy * ZOOM;
+  p += toPointer * uPointer.z * 0.22 * exp(-dot(toPointer, toPointer) * 3.0);
+
+  // Ground: two pale tones.
+  vec2 g = flow(p * 0.8, t * 0.5, 4.0, 0.35);
+  vec3 col = mix(paint(0, p, t), paint(1, p, t), smoothstep(-0.55, 0.55, g.x * 0.8 + g.y * 0.6));
+
+  // Sheets are level sets of one folded field, so they nest instead of crossing.
+  vec2 q = flow(p, t, 0.0, 0.43);
+  float fold = dot(q, vec2(0.72, -0.69)) + 0.06 * sin(t * 0.11);
+  // Position along the fold: each band thins out towards one end.
+  float along = dot(q, vec2(0.69, 0.72)) + 0.12 * sin(t * 0.07);
+
+  float d = distanceOf(fold + 0.46 + 0.05 * sin(q.y * 1.6 + t * 0.17));
+  sheet(col, d, mix(0.004, 0.08, drift(p, t, 1.0)), mix(0.45, 1.3, drift(p, t, 2.0)), paint(3, p, t), mix(0.12, 1.0, smoothstep(0.42, -0.3, along)));
+  glint(col, d, 0.35 * smoothstep(0.7, 0.98, drift(p, t, 11.0)), paint(4, p, t));
+
+  d = distanceOf(fold + 0.16 + 0.07 * sin(q.y * 1.3 - t * 0.14 + 1.0));
+  sheet(col, d, mix(0.003, 0.10, drift(p, t, 3.0)), mix(0.6, 1.6, drift(p, t, 4.0)), paint(4, p, t), mix(0.1, 1.0, smoothstep(0.34, -0.42, along + 0.1 * sin(q.x * 2.0 + t * 0.1))));
+  glint(col, d, 0.3 * smoothstep(0.7, 0.98, drift(p, t, 13.0)), paint(0, p, t));
+
+  d = distanceOf(fold - 0.14 + 0.08 * sin(q.y * 1.1 + t * 0.12 + 2.0));
+  sheet(col, d, mix(0.003, 0.14, drift(p, t, 5.0)), 4.0, paint(4, p, t), mix(0.25, 1.0, smoothstep(0.5, -0.25, along)));
+  glint(col, d, 0.6 * smoothstep(0.65, 0.98, drift(p, t, 15.0)), paint(0, p, t));
+
+  // Accent pools in the depth of the fold, beneath the second hue family.
+  float pool = smoothstep(0.08, 0.62, fold + 0.22 * (drift(p, t, 17.0) - 0.5));
+  col = mix(col, paint(6, p, t), pool * 0.9);
+  stipple += pool * (1.0 - pool);
+
+  // Second hue family: a broad wash, with a lobe swelling out of its edge.
+  vec2 r = flow(p, t * 0.7, 3.1, 0.30);
+  float wash = dot(r, vec2(0.93, 0.36)) - 0.20 + 0.08 * sin(t * 0.1);
+  d = distanceOf(wash);
+  sheet(col, d, mix(0.03, 0.55, drift(p, t, 16.0)), 1000.0, mix(paint(2, p, t), paint(5, p, t), smoothstep(0.7, -0.1, along)), 1.0);
+
+  vec2 c = vec2(0.14 + 0.10 * sin(t * 0.17), 0.04 + 0.16 * cos(t * 0.13));
+  vec2 rel = flow(p - c, t * 0.7, 5.1, 0.2) * vec2(0.85, 1.1);
+  float radius = 0.25 + 0.04 * sin(t * 0.21);
+  float lobe = smax((radius * radius - dot(rel, rel)) / (2.0 * radius), wash - 0.16, 0.42);
+  // Crisp on the leading side, dissolving on the trailing side.
+  float angle = t * 0.08 + 2.2;
+  float facing = dot(normalize(rel + 1e-4), vec2(cos(angle), sin(angle)));
+  d = lobe;   // already distance-scaled; normalising would pinch the soft side
+  vec3 lobeTint = mix(paint(5, p, t), paint(2, p, t), smoothstep(-0.9, 1.1, dot(rel, vec2(sin(angle), -cos(angle))) / radius));
+  sheet(col, d, mix(0.006, 0.62, smoothstep(-0.6, 0.8, facing)), 1000.0, lobeTint, 1.0);
+
+  fragColor = vec4(col, clamp(stipple, 0.0, 1.0));
+}
+</script>
+
+<!-- Composite pass: runs at full resolution so the grain stays sharp. -->
+<script id="post" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uScene;
+uniform vec2  uRes;
+uniform float uGrainSeed;
+uniform float uPixel;     // device pixels per grain cell
+
+float hash(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+// Two-pixel value noise: film grain clumps, it isn't per-pixel static.
+float grain(vec2 px, float seed) {
+  vec2 c = px / uPixel;
+  vec2 i = floor(c), f = fract(c);
+  f = f * f * (3.0 - 2.0 * f);
+  vec2 s = vec2(seed * 17.0, seed * 41.0);
+  float n = mix(mix(hash(i + s), hash(i + s + vec2(1, 0)), f.x),
+                mix(hash(i + s + vec2(0, 1)), hash(i + s + vec2(1, 1)), f.x), f.y);
+  return n + (hash(gl_FragCoord.xy + s) - 0.5) * 0.45 - 0.5;
+}
+
+void main() {
+  vec4 scene = texture(uScene, vUv);
+  vec3 col = scene.rgb;
+
+  // Grain is strongest where pigment is half laid down, like airbrush stipple.
+  float n = grain(gl_FragCoord.xy, uGrainSeed);
+  float amount = 0.04 + 0.13 * scene.a;
+  col += n * amount * (0.55 + 0.45 * (1.0 - abs(dot(col, vec3(0.33)) * 2.0 - 1.0)));
+
+  // Fixed dust on the emulsion.
+  vec2 cell = floor(gl_FragCoord.xy / (uPixel * 1.5));
+  if (hash(cell + 3.7) > 0.9994) col *= 0.82;
+
+  // Gentle corner falloff.
+  vec2 v = vUv - 0.5;
+  col *= 1.0 - dot(v, v) * 0.22;
+
+  fragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const num = (key, fallback) => params.has(key) ? parseFloat(params.get(key)) : fallback;
+
+  // Sampled from the reference images: ground, ground, wash, sheet, deep sheet, lobe, accent.
+  const PALETTES = [
+    ['#d6d3d0', '#bcd3c8', '#49ad50', '#3a2cc6', '#1428ac', '#62dc7c', '#1b1fa6'],
+    ['#d8dde0', '#c4d6e2', '#e8622a', '#3f86b4', '#1c5f96', '#e98448', '#13416f'],
+    ['#e8795a', '#d9604a', '#6aa8ec', '#c23a26', '#ad2c20', '#5fd2fb', '#96225a'],
+    ['#f4efe4', '#ecdfc4', '#7fbbea', '#dca744', '#bf8a32', '#3f9cf6', '#2f7ee0'],
+  ].map(p => p.flatMap(hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255)));
+
+  const HOLD = 9;        // seconds on a palette
+  const MORPH = 14;      // seconds moving to the next
+  const SPEED = num('speed', 0.55);
+  const SCENE_SCALE = 0.5;
+  const MAX_DPR = 2;
+
+  const canvas = document.getElementById('flow');
+  const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'low-power', preserveDrawingBuffer: params.has('still') });
+  if (!gl) return;   // The body background colour stands in.
+
+  const src = id => document.getElementById(id).textContent.trim();
+  const compile = (type, text) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, text);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const program = fragId => {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, src('vert')));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, src(fragId)));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const uniforms = {};
+    const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < count; i++) {
+      const name = gl.getActiveUniform(p, i).name.replace('[0]', '');
+      uniforms[name] = gl.getUniformLocation(p, name);
+    }
+    return { p, u: uniforms };
+  };
+
+  const scene = program('scene');
+  const post = program('post');
+  gl.bindVertexArray(gl.createVertexArray());
+
+  // Float target keeps the long gradients free of banding.
+  const float = !!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float');
+  const texture = gl.createTexture();
+  const framebuffer = gl.createFramebuffer();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  let dpr = 1, sceneW = 1, sceneH = 1;
+  const resize = () => {
+    dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    sceneW = Math.max(1, Math.round(canvas.width * SCENE_SCALE));
+    sceneH = Math.max(1, Math.round(canvas.height * SCENE_SCALE));
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    if (float) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, sceneW, sceneH, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, sceneW, sceneH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  };
+  new ResizeObserver(resize).observe(canvas);
+  resize();
+
+  // Pointer position and presence, both eased so nothing ever snaps.
+  const pointer = { x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0 };
+  window.addEventListener('pointermove', e => {
+    const size = Math.sqrt(innerWidth * innerHeight);
+    pointer.tx = (e.clientX - innerWidth / 2) / size;
+    pointer.ty = (innerHeight / 2 - e.clientY) / size;
+    pointer.tz = 1;
+  });
+  document.documentElement.addEventListener('mouseleave', () => { pointer.tz = 0; });
+
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const still = params.has('still');
+  const fixedTime = num('t', 150);   // opens on a strong composition
+  const fixedPalette = params.has('p') ? parseInt(params.get('p'), 10) : null;
+  const fixedMorph = num('morph', 0);
+
+  let palette = fixedPalette ?? 0;
+  let clock = fixedTime;       // animation time, seconds
+  let morphClock = 0;          // seconds spent on this palette
+  let last = performance.now();
+  let raf = 0;
+
+  // Click to jump straight into the morph.
+  window.addEventListener('click', () => { morphClock = Math.max(morphClock, HOLD); });
+
+  const draw = () => {
+    const eased = m => m * m * (3 - 2 * m);
+    const morph = still ? fixedMorph : eased(Math.min(1, Math.max(0, (morphClock - HOLD) / MORPH)));
+    const next = (palette + 1) % PALETTES.length;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.viewport(0, 0, sceneW, sceneH);
+    gl.useProgram(scene.p);
+    gl.uniform2f(scene.u.uRes, sceneW, sceneH);
+    gl.uniform1f(scene.u.uTime, clock);
+    gl.uniform3fv(scene.u.uFrom, PALETTES[palette]);
+    gl.uniform3fv(scene.u.uTo, PALETTES[next]);
+    gl.uniform1f(scene.u.uMorph, morph);
+    gl.uniform3f(scene.u.uPointer, pointer.x, pointer.y, pointer.z);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(post.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(post.u.uScene, 0);
+    gl.uniform2f(post.u.uRes, canvas.width, canvas.height);
+    gl.uniform1f(post.u.uGrainSeed, Math.floor(performance.now() / 66) % 97 / 97);   // about 15fps, like film
+    gl.uniform1f(post.u.uPixel, Math.max(1, dpr));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  };
+
+  const frame = now => {
+    raf = requestAnimationFrame(frame);
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    clock += dt * SPEED;
+    morphClock += dt;
+    if (morphClock >= HOLD + MORPH) {
+      morphClock = 0;
+      palette = (palette + 1) % PALETTES.length;
+    }
+    pointer.x += (pointer.tx - pointer.x) * 0.03;
+    pointer.y += (pointer.ty - pointer.y) * 0.03;
+    pointer.z += (pointer.tz - pointer.z) * 0.02;
+    draw();
+  };
+
+  if (still || reduced) {
+    draw();
+    window.__ready = true;
+    new ResizeObserver(() => draw()).observe(canvas);
+    return;
+  }
+
+  // Stop rendering whenever the canvas can't be seen.
+  const start = () => { if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); } };
+  const stop = () => { cancelAnimationFrame(raf); raf = 0; };
+  let onScreen = true;
+  new IntersectionObserver(([e]) => { onScreen = e.isIntersecting; onScreen && !document.hidden ? start() : stop(); }).observe(canvas);
+  document.addEventListener('visibilitychange', () => { onScreen && !document.hidden ? start() : stop(); });
+  start();
+})();
+</script>
+</body>
+</html>
