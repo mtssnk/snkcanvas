@@ -37,16 +37,7 @@ npm run build      # library, to dist/
 npm run build:demo # demo as a static site, to dist-demo/
 ```
 
-The demo reads URL parameters, which is the quickest way to try settings without editing code:
-
-| URL | Effect |
-| --- | --- |
-| `?speed=0.6` | Slower motion |
-| `?zoom=0.7` | Further out, more tubes |
-| `?tubes=3` | Thinner, denser tubes |
-| `?paused&t=48&p=2` | Hold the frame at clock 48 on palette 2 |
-
-Clicking the demo moves to the next palette.
+To try settings, edit the props in [demo/main.tsx](demo/main.tsx). The dev server reloads as you save. Clicking the demo moves to the next palette.
 
 ## Adding it to a React project
 
@@ -108,8 +99,23 @@ All props are optional and can change between renders, except the two marked as 
 | `respectReducedMotion` | `true` | Show a still frame when the visitor prefers reduced motion |
 | `renderScale` | `0.5` | Tube resolution relative to the canvas. Lower is cheaper and softer |
 | `maxDpr` | `2` | Device pixel ratio cap |
-| `startTime` | `20` | Read once. Clock at the first frame, which sets the opening composition |
+| `startTime` | `20` | Read once. Clock at the first frame, which sets the opening composition. The motion never repeats, so any value gives a new one. Keep it under about 10,000, as float precision makes motion steppy beyond that |
 | `startPalette` | `0` | Read once. Index of the first palette |
+
+### A different opening each visit
+
+Pick random start values once, with `useState`, so they stay fixed across re-renders:
+
+```tsx
+const [start] = useState(() => ({
+  time: Math.random() * 1000,
+  palette: Math.floor(Math.random() * palettes.length),
+}));
+
+<SnkCanvas palettes={palettes} startTime={start.time} startPalette={start.palette} />;
+```
+
+With server rendering, the server and browser pick different values, so the fallback background won't match on hydration. Pick the values in a `useEffect` instead, and render `SnkCanvas` once they're set.
 
 ### Custom palettes
 

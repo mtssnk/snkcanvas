@@ -10,10 +10,11 @@ export interface Palette {
 
 /** Cycled in order by default. Tuned up from the reference images. */
 export const defaultPalettes: Palette[] = [
-  { pale: '#e2e6e2', deep: '#0c1484', neon: ['#1c2cff', '#37f08a', '#6a2cf0'] },
-  { pale: '#e8edf0', deep: '#0f3a6b', neon: ['#ff5a14', '#1f7fd0', '#ffa050'] },
-  { pale: '#ffd8cc', deep: '#7a1030', neon: ['#ff3a1e', '#35d6ff', '#e0228a'] },
-  { pale: '#fbf4e6', deep: '#8a5a18', neon: ['#ffb52e', '#2f9dff', '#ff8a1e'] },
+  // Sampled from _temp/image.png: violet-blue, green and chalky grey.
+  { pale: "#c4c8cc", deep: "#011a90", neon: ["#2a24c4", "#46e070", "#c0c6c6"] },
+  { pale: "#dadada", deep: "#0f3a6b", neon: ["#ff5a14", "#1f7fd0", "#ffa050"] },
+  { pale: "#ffd8cc", deep: "#7a1030", neon: ["#ff3a1e", "#bfc3c4", "#e0228a"] },
+  { pale: "#fbf4e6", deep: "#740017", neon: ["#ffb52e", "#2f9dff", "#ff8a1e"] },
 ];
 
 const toRgb = (hex: string): number[] => {
