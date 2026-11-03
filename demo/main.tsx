@@ -19,8 +19,8 @@ function Demo() {
       palettes={palettes}
       onClick={() => canvas.current?.nextPalette()}
       speed={0.77}
-      zoom={0.7}
-      tubes={2.1}
+      zoom={0.8}
+      tubes={1.9}
       pointerPull={0.4}
       pointerResponse={0.6}
       holdSeconds={0}
